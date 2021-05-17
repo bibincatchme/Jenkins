@@ -1,0 +1,103 @@
+pipeline {
+  agent {
+    kubernetes {
+      label "${UUID.randomUUID().toString()}"
+      defaultContainer 'tools'
+      yamlFile 'buildpod.yaml'
+    }
+  }
+
+  stages {
+
+    ...
+
+    stage('Sonarqube PR analysis') {
+      when {
+        changeRequest()
+      }
+      steps {
+        withSonarQubeEnv('sonarqube') {
+          sh """
+            cp sonar-project.properties /tmp/sonar-project.properties
+            echo "sonar.host.url=${SONAR_HOST_URL}
+sonar.login=${SONAR_AUTH_TOKEN}
+sonar.pullrequest.key=${env.CHANGE_ID}
+sonar.pullrequest.base=${env.CHANGE_TARGET}
+sonar.pullrequest.branch=${env.CHANGE_BRANCH}" >> /tmp/sonar-project.properties
+
+            make jenkins-sonarqube
+          """
+        }
+      }
+    }
+
+
+    stage('Sonarqube analysis') {
+      when {
+        branch 'master'
+      }
+      steps {
+        withSonarQubeEnv('sonarqube') {
+          sh """
+            cp sonar-project.properties /tmp/sonar-project.properties
+            echo "sonar.host.url=$SONAR_HOST_URL
+sonar.login=$SONAR_AUTH_TOKEN
+sonar.branch.name=$BRANCH_NAME" >> /tmp/sonar-project.properties
+
+            make jenkins-sonarqube
+          """
+        }
+      }
+    }
+    stage("Quality Gate") {
+      when {
+        anyOf {
+          changeRequest()
+          branch 'master'
+        }
+      }
+      steps {
+        timeout(time: 1, unit: 'HOURS') {
+          waitForQualityGate abortPipeline: true
+        }
+      }
+    }
+
+    stage('Build and push dev docker image') {
+      when {
+        changeRequest()
+      }
+      environment {
+        DOCKER_CONFIG = "/home/ci/.docker-development"
+      }
+      steps {
+        sh '''
+          make jenkins-skaffold
+          skaffold build -p dev
+        '''
+      }
+    }
+
+    stage('Build and push docker image; deploy; create GitHub release') {
+      when {
+        branch 'master'
+      }
+      environment {
+        DOCKER_CONFIG = "/home/ci/.docker-releases"
+      }
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'github', usernameVariable: 'GITHUB_USERNAME', passwordVariable: 'GITHUB_TOKEN')]) {
+          sh '''
+            # Setting Git credentials for release-version script
+            git config credential.helper 'store --file /tmp/.gitcredentials'
+
+            make jenkins-skaffold
+            export VERSION=$(jx-release-version)
+            skaffold run --namespace=cockpit-dev
+            create-release -v "${VERSION}" -t "${GITHUB_TOKEN}"
+          '''
+        }
+      }
+    }
+  }
+}
